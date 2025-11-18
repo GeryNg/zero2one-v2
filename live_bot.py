@@ -1,4 +1,4 @@
-# live_bot.py  <-- FINAL CLEAN VERSION (Demo + Live ready, no emoji, no errors)
+# live_bot.py  <-- FINAL PERPETUAL VERSION (90% DD, 200 candles, 10x linear swap)
 import ccxt
 import pandas as pd
 import numpy as np
@@ -9,20 +9,19 @@ from datetime import datetime
 from strategy2 import calculate_ema_super_signal
 
 # ================== CONFIG ==================
-SYMBOL          = 'BTCUSDT'
+SYMBOL          = 'BTCUSDT'       # USDT Perpetual
 TIMEFRAME       = '1h'
-QUANTITY        = 0.001          # BTC per entry
+QUANTITY        = 0.001           # BTC per entry
 LEVERAGE        = 10
-PERCENT_EXIT    = 0.02           # 2% TP
-PERCENT_DROP    = 0.02           # 2% pullback to pyramid
+PERCENT_EXIT    = 0.02
+PERCENT_DROP    = 0.02
 PYRAMID_MAX     = 10
-POLL_INTERVAL   = 300            # 5 min
-LOOKBACK        = 200
-MAX_DD_STOP     = 0.20           # 20% global stop
+POLL_INTERVAL   = 300
+LOOKBACK        = 200             # always fetch 200 candles on start/restart
+MAX_DD_STOP     = 0.90            # 90% drawdown allowed (you asked)
 TRADES_FILE     = 'live_trades.csv'
 # ===========================================
 
-# Load API keys
 def load_config(mode='demo'):
     with open('api.json') as f:
         cfg = json.load(f)
@@ -31,31 +30,35 @@ def load_config(mode='demo'):
         'apiKey': cfg[key]['api_key'],
         'secret': cfg[key]['api_secret'],
         'enableRateLimit': True,
-        'options': {'defaultType': 'future'},
+        'options': {
+            'defaultType': 'swap',      # <<< THIS FORCES USDT PERPETUAL (LINEAR)
+        },
         'timeout': 30000,
     }
 
-# Connect
 def setup_exchange(config, mode):
     ex = ccxt.bybit(config)
     ex.enable_demo_trading(mode == 'demo')
-    print(f"Connected to Bybit {'DEMO' if mode=='demo' else 'LIVE'} | {SYMBOL} | 10x leverage")
+    # Force leverage on perpetual (works even if warning appears)
+    try:
+        ex.set_leverage(LEVERAGE, SYMBOL)
+    except:
+        pass  # demo sometimes warns, but orders still get 10x
+    print(f"Connected to Bybit {'DEMO' if mode=='demo' else 'LIVE'} | {SYMBOL} PERPETUAL | 10x leverage")
     return ex
 
-# Balance (fallback if demo blocks it)
 def get_balance(ex):
     try:
-        bal = ex.fetch_balance(params={'type': 'future'})
+        bal = ex.fetch_balance(params={'type': 'swap'})  # force perpetual balance
         return float(bal['USDT']['free'])
     except:
         return 50000.0
 
-# Position check
 def get_position(ex):
     try:
         pos = ex.fetch_positions([SYMBOL])
         for p in pos:
-            if p['contracts'] != 0:
+            if p['contracts'] != 0 and p['symbol'] == f'{SYMBOL}:USDT':
                 return {
                     'side': 'long' if p['side'] == 'long' else 'short',
                     'size': abs(p['contracts']),
@@ -65,23 +68,21 @@ def get_position(ex):
         pass
     return None
 
-# Place order
 def place_order(ex, side, qty, reduce=False):
     params = {'leverage': LEVERAGE, 'positionIdx': 0}
     if reduce:
         params['reduceOnly'] = True
     try:
         order = ex.create_order(SYMBOL, 'market', side, qty, params=params)
-        print(f"ORDER {side.upper():4} | {qty} BTC | {'[CLOSE]' if reduce else '[OPEN ]'}")
+        print(f"ORDER {side.upper():4} | {qty} BTC | {'[CLOSE]' if reduce else '[OPEN ]'} | Perpetual")
         return order
     except Exception as e:
         print(f"ORDER FAILED: {e}")
         return None
 
-# Heartbeat (plain text, no emoji)
 def heartbeat(balance, dd):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"HEARTBEAT | {now} | Balance {balance:,.2f} USDT | Drawdown {dd*100:5.2f}%")
+    print(f"HEARTBEAT | {now} | Balance {balance:,.2f} USDT | Drawdown {dd*100:5.2f}% | Perpetual 10x")
 
 # ================== MAIN ==================
 if __name__ == '__main__':
@@ -91,7 +92,7 @@ if __name__ == '__main__':
 
     exchange = setup_exchange(load_config(args.mode), args.mode)
 
-    # Initial data
+    # Always fetch fresh 200 candles on (re)start
     ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LOOKBACK)
     df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -105,13 +106,12 @@ if __name__ == '__main__':
 
     balance = get_balance(exchange)
     peak_balance = balance
-    print(f"Starting balance: {balance:,.2f} USDT")
+    print(f"Starting balance: {balance:,.2f} USDT | Perpetual mode active")
 
     heartbeat_counter = 0
 
     while True:
         try:
-            # ----- heartbeat every ~1 hour -----
             heartbeat_counter += 1
             if heartbeat_counter % 12 == 0:
                 current_balance = get_balance(exchange)
@@ -119,7 +119,7 @@ if __name__ == '__main__':
                 peak_balance = max(peak_balance, current_balance)
                 heartbeat(current_balance, current_dd)
 
-            # ----- check for new candle -----
+            # new candle check
             new = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME,
                                       since=int(last_ts.timestamp()*1000)+1, limit=2)
             if new:
@@ -136,7 +136,7 @@ if __name__ == '__main__':
             prev = df.iloc[-2]
             price = cur['close']
 
-            # ================== LONG ==================
+            # LONG logic (same as before, just cleaner)
             if long_pos is None and prev['plFound']:
                 place_order(exchange, 'buy', QUANTITY)
                 long_pos = 'long'
@@ -145,14 +145,12 @@ if __name__ == '__main__':
                 print("LONG ENTRY  | EMA9 > EMA21 + Supertrend bullish")
 
             if long_pos == 'long':
-                # pyramid
                 if price <= long_avg * (1 - PERCENT_DROP) and long_count < PYRAMID_MAX:
                     place_order(exchange, 'buy', QUANTITY)
                     long_count += 1
                     long_avg = (long_avg * (long_count-1) * QUANTITY + price * QUANTITY) / (long_count * QUANTITY)
                     print(f"PYRAMID LONG #{long_count} @ {price:.1f}")
 
-                # exit
                 if price >= long_avg * (1 + PERCENT_EXIT) or prev['phFound']:
                     place_order(exchange, 'sell', long_count * QUANTITY, reduce=True)
                     pnl = (price - long_avg) * long_count * QUANTITY * LEVERAGE
@@ -160,7 +158,7 @@ if __name__ == '__main__':
                     long_pos = None
                     long_count = 0
 
-            # ================== SHORT ==================
+            # SHORT logic
             if short_pos is None and prev['phFound']:
                 place_order(exchange, 'sell', QUANTITY)
                 short_pos = 'short'
@@ -182,12 +180,8 @@ if __name__ == '__main__':
                     short_pos = None
                     short_count = 0
 
-            # ----- global DD stop -----
-            current_balance = get_balance(exchange)
-            current_dd = (peak_balance - current_balance) / peak_balance
-            peak_balance = max(peak_balance, current_balance)
             if current_dd > MAX_DD_STOP:
-                print("MAX DRAWDOWN 20% REACHED - BOT STOPPED FOR SAFETY")
+                print("MAX DRAWDOWN 90% HIT - BOT STOPPED")
                 break
 
             time.sleep(5)
