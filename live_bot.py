@@ -1,4 +1,4 @@
-# live_bot.py  <-- FINAL FIXED VERSION (Perpetual + 90% DD + 200 candles)
+# live_bot.py  <-- FINAL REVERSE VERSION (0.007 qty + reverse on opposite signal + 5 min heartbeat)
 import ccxt
 import pandas as pd
 import numpy as np
@@ -11,15 +11,13 @@ from strategy2 import calculate_ema_super_signal
 # ================== CONFIG ==================
 SYMBOL          = 'BTCUSDT'
 TIMEFRAME       = '1h'
-QUANTITY        = 0.001
+QUANTITY        = 0.007           # <<< changed to 0.007 BTC per entry
 LEVERAGE        = 10
 PERCENT_EXIT    = 0.02
 PERCENT_DROP    = 0.02
 PYRAMID_MAX     = 10
-POLL_INTERVAL   = 300
 LOOKBACK        = 200
-MAX_DD_STOP     = 0.90            # 90% drawdown allowed
-TRADES_FILE     = 'live_trades.csv'
+MAX_DD_STOP     = 0.90
 # ===========================================
 
 def load_config(mode='demo'):
@@ -30,7 +28,7 @@ def load_config(mode='demo'):
         'apiKey': cfg[key]['api_key'],
         'secret': cfg[key]['api_secret'],
         'enableRateLimit': True,
-        'options': {'defaultType': 'swap'},   # <<< USDT Perpetual
+        'options': {'defaultType': 'swap'},
         'timeout': 30000,
     }
 
@@ -51,28 +49,25 @@ def get_balance(ex):
     except:
         return 50000.0
 
-def get_position(ex):
+def close_position(ex, side, qty):
+    if qty <= 0:
+        return
+    close_side = 'sell' if side == 'long' else 'buy'
+    params = {'leverage': LEVERAGE, 'reduceOnly': True}
     try:
-        pos = ex.fetch_positions([SYMBOL])
-        for p in pos:
-            if p['contracts'] != 0 and p['symbol'] == f'{SYMBOL}:USDT':
-                return {'side': 'long' if p['side'] == 'long' else 'short',
-                        'size': abs(p['contracts']),
-                        'entry': float(p['entryPrice'])}
-    except:
-        pass
-    return None
+        order = ex.create_order(SYMBOL, 'market', close_side, qty, params=params)
+        print(f"CLOSE {side.upper()} | {qty} BTC | FULL EXIT BEFORE REVERSE")
+    except Exception as e:
+        print(f"CLOSE FAILED: {e}")
 
-def place_order(ex, side, qty, reduce=False):
+def place_order(ex, side, qty):
     params = {'leverage': LEVERAGE, 'positionIdx': 0}
-    if reduce:
-        params['reduceOnly'] = True
     try:
         order = ex.create_order(SYMBOL, 'market', side, qty, params=params)
-        print(f"ORDER {side.upper():4} | {qty} BTC | {'[CLOSE]' if reduce else '[OPEN ]'}")
+        print(f"OPEN  {side.upper():4} | {qty} BTC")
         return order
     except Exception as e:
-        print(f"ORDER FAILED: {e}")
+        print(f"OPEN FAILED: {e}")
         return None
 
 def heartbeat(balance, dd):
@@ -93,9 +88,9 @@ if __name__ == '__main__':
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('ts', inplace=True)
 
-    long_pos = short_pos = None
-    long_count = short_count = 0
-    long_avg = short_avg = 0.0
+    position = None        # 'long' / 'short' / None
+    trade_count = 0
+    avg_price = 0.0
     last_ts = df.index[-1]
 
     balance = get_balance(exchange)
@@ -103,12 +98,12 @@ if __name__ == '__main__':
     print(f"Starting balance: {balance:,.2f} USDT | Perpetual mode active")
 
     heartbeat_counter = 0
-    current_dd = 0.0   # <<< THIS WAS MISSING BEFORE
+    current_dd = 0.0
 
     while True:
         try:
             heartbeat_counter += 1
-            if heartbeat_counter % 12 == 0:          # every ~1 hour
+            if heartbeat_counter % 60 == 0:          # every 5 minutes (5s loop * 60 = 300s)
                 current_balance = get_balance(exchange)
                 current_dd = (peak_balance - current_balance) / peak_balance
                 peak_balance = max(peak_balance, current_balance)
@@ -131,51 +126,70 @@ if __name__ == '__main__':
             prev = df.iloc[-2]
             price = cur['close']
 
-            # LONG
-            if long_pos is None and prev['plFound']:
-                place_order(exchange, 'buy', QUANTITY)
-                long_pos = 'long'
-                long_count = 1
-                long_avg = price
-                print("LONG ENTRY  | EMA9 > EMA21 + Supertrend up")
+            long_signal = prev['plFound']
+            short_signal = prev['phFound']
 
-            if long_pos == 'long':
-                if price <= long_avg * (1 - PERCENT_DROP) and long_count < PYRAMID_MAX:
+            # REVERSE LOGIC
+            if position == 'long' and short_signal:
+                close_position(exchange, 'long', trade_count * QUANTITY)
+                place_order(exchange, 'sell', QUANTITY)   # open short
+                position = 'short'
+                trade_count = 1
+                avg_price = price
+                print("REVERSE LONG → SHORT")
+
+            elif position == 'short' and long_signal:
+                close_position(exchange, 'short', trade_count * QUANTITY)
+                place_order(exchange, 'buy', QUANTITY)    # open long
+                position = 'long'
+                trade_count = 1
+                avg_price = price
+                print("REVERSE SHORT → LONG")
+
+            # NORMAL ENTRY (only when flat)
+            elif position is None:
+                if long_signal:
                     place_order(exchange, 'buy', QUANTITY)
-                    long_count += 1
-                    long_avg = (long_avg * (long_count-1) * QUANTITY + price * QUANTITY) / (long_count * QUANTITY)
-                    print(f"PYRAMID LONG #{long_count}")
-
-                if price >= long_avg * (1 + PERCENT_EXIT) or prev['phFound']:
-                    place_order(exchange, 'sell', long_count * QUANTITY, reduce=True)
-                    pnl = (price - long_avg) * long_count * QUANTITY * LEVERAGE
-                    print(f"LONG EXIT   | PnL ~{pnl:+.1f} USDT")
-                    long_pos = None
-                    long_count = 0
-
-            # SHORT
-            if short_pos is None and prev['phFound']:
-                place_order(exchange, 'sell', QUANTITY)
-                short_pos = 'short'
-                short_count = 1
-                short_avg = price
-                print("SHORT ENTRY | EMA9 < EMA21 + Supertrend down")
-
-            if short_pos == 'short':
-                if price >= short_avg * (1 + PERCENT_DROP) and short_count < PYRAMID_MAX:
+                    position = 'long'
+                    trade_count = 1
+                    avg_price = price
+                    print("LONG ENTRY")
+                elif short_signal:
                     place_order(exchange, 'sell', QUANTITY)
-                    short_count += 1
-                    short_avg = (short_avg * (short_count-1) * QUANTITY + price * QUANTITY) / (short_count * QUANTITY)
-                    print(f"PYRAMID SHORT #{short_count}")
+                    position = 'short'
+                    trade_count = 1
+                    avg_price = price
+                    print("SHORT ENTRY")
 
-                if price <= short_avg * (1 - PERCENT_EXIT) or prev['plFound']:
-                    place_order(exchange, 'buy', short_count * QUANTITY, reduce=True)
-                    pnl = (short_avg - price) * short_count * QUANTITY * LEVERAGE
-                    print(f"SHORT EXIT  | PnL ~{pnl:+.1f} USDT")
-                    short_pos = None
-                    short_count = 0
+            # PYRAMID (only same direction, on price pullback)
+            if position == 'long' and price <= avg_price * (1 - PERCENT_DROP) and trade_count < PYRAMID_MAX:
+                place_order(exchange, 'buy', QUANTITY)
+                trade_count += 1
+                avg_price = (avg_price * (trade_count-1) * QUANTITY + price * QUANTITY) / (trade_count * QUANTITY)
+                print(f"PYRAMID LONG #{trade_count}")
 
-            # Global drawdown check
+            if position == 'short' and price >= avg_price * (1 + PERCENT_DROP) and trade_count < PYRAMID_MAX:
+                place_order(exchange, 'sell', QUANTITY)
+                trade_count += 1
+                avg_price = (avg_price * (trade_count-1) * QUANTITY + price * QUANTITY) / (trade_count * QUANTITY)
+                print(f"PYRAMID SHORT #{trade_count}")
+
+            # TAKE PROFIT EXIT
+            if position == 'long' and price >= avg_price * (1 + PERCENT_EXIT):
+                close_position(exchange, 'long', trade_count * QUANTITY)
+                pnl = (price - avg_price) * trade_count * QUANTITY * LEVERAGE
+                print(f"LONG TP HIT | PnL ~{pnl:+.1f} USDT")
+                position = None
+                trade_count = 0
+
+            if position == 'short' and price <= avg_price * (1 - PERCENT_EXIT):
+                close_position(exchange, 'short', trade_count * QUANTITY)
+                pnl = (avg_price - price) * trade_count * QUANTITY * LEVERAGE
+                print(f"SHORT TP HIT | PnL ~{pnl:+.1f} USDT")
+                position = None
+                trade_count = 0
+
+            # Global DD check
             current_balance = get_balance(exchange)
             current_dd = (peak_balance - current_balance) / peak_balance
             peak_balance = max(peak_balance, current_balance)
