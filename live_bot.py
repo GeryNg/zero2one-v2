@@ -1,7 +1,6 @@
-# live_bot.py  <-- FINAL REVERSE VERSION (0.007 qty + reverse on opposite signal + 5 min heartbeat)
+# live_bot.py  <-- PURE REVERSE BOT (No TP, 10-min confirm, reverse only)
 import ccxt
 import pandas as pd
-import numpy as np
 import json
 import time
 import argparse
@@ -11,13 +10,11 @@ from strategy2 import calculate_ema_super_signal
 # ================== CONFIG ==================
 SYMBOL          = 'BTCUSDT'
 TIMEFRAME       = '1h'
-QUANTITY        = 0.007           # <<< changed to 0.007 BTC per entry
+QUANTITY        = 0.007
 LEVERAGE        = 10
-PERCENT_EXIT    = 0.02
-PERCENT_DROP    = 0.02
-PYRAMID_MAX     = 10
 LOOKBACK        = 200
 MAX_DD_STOP     = 0.90
+CONFIRM_SECONDS = 600   # 10 minutes
 # ===========================================
 
 def load_config(mode='demo'):
@@ -39,40 +36,34 @@ def setup_exchange(config, mode):
         ex.set_leverage(LEVERAGE, SYMBOL)
     except:
         pass
-    print(f"Connected to Bybit {'DEMO' if mode=='demo' else 'LIVE'} | {SYMBOL} PERPETUAL | 10x leverage")
+    print(f"Connected to Bybit {'DEMO' if mode=='demo' else 'LIVE'} | {SYMBOL} PERPETUAL | 10x | REVERSE ONLY")
     return ex
 
 def get_balance(ex):
     try:
-        bal = ex.fetch_balance(params={'type': 'swap'})
-        return float(bal['USDT']['free'])
+        return float(ex.fetch_balance(params={'type': 'swap'})['USDT']['free'])
     except:
         return 50000.0
 
-def close_position(ex, side, qty):
-    if qty <= 0:
-        return
-    close_side = 'sell' if side == 'long' else 'buy'
-    params = {'leverage': LEVERAGE, 'reduceOnly': True}
+def close_and_reverse(ex, current_side, new_side):
+    if current_side:
+        close_side = 'sell' if current_side == 'long' else 'buy'
+        try:
+            ex.create_order(SYMBOL, 'market', close_side, QUANTITY, params={'reduceOnly': True})
+            print(f"CLOSE {current_side.upper()} | {QUANTITY:.5f} BTC")
+        except Exception as e:
+            print(f"CLOSE FAILED: {e}")
+    
     try:
-        order = ex.create_order(SYMBOL, 'market', close_side, qty, params=params)
-        print(f"CLOSE {side.upper()} | {qty} BTC | FULL EXIT BEFORE REVERSE")
-    except Exception as e:
-        print(f"CLOSE FAILED: {e}")
-
-def place_order(ex, side, qty):
-    params = {'leverage': LEVERAGE, 'positionIdx': 0}
-    try:
-        order = ex.create_order(SYMBOL, 'market', side, qty, params=params)
-        print(f"OPEN  {side.upper():4} | {qty} BTC")
-        return order
+        order = ex.create_order(SYMBOL, 'market', new_side, QUANTITY)
+        price = ex.fetch_ticker(SYMBOL)['last']
+        print(f"REVERSE → OPEN {new_side.upper()} | {QUANTITY:.5f} BTC @ {price}")
     except Exception as e:
         print(f"OPEN FAILED: {e}")
-        return None
 
 def heartbeat(balance, dd):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"HEARTBEAT | {now} | Balance {balance:,.2f} USDT | Drawdown {dd*100:5.2f}%")
+    print(f"HEARTBEAT | {now} | Balance {balance:,.2f} USDT | DD {dd*100:5.2f}%")
 
 # ================== MAIN ==================
 if __name__ == '__main__':
@@ -82,34 +73,36 @@ if __name__ == '__main__':
 
     exchange = setup_exchange(load_config(args.mode), args.mode)
 
-    # Always load 200 candles on start
+    # Load 200 candles
     ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LOOKBACK)
     df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('ts', inplace=True)
 
-    position = None        # 'long' / 'short' / None
-    trade_count = 0
-    avg_price = 0.0
+    position = None                    # 'long', 'short', or None
+    pending_signal = None              # 'long' or 'short'
+    signal_time = 0
     last_ts = df.index[-1]
 
     balance = get_balance(exchange)
     peak_balance = balance
-    print(f"Starting balance: {balance:,.2f} USDT | Perpetual mode active")
+    print(f"Starting balance: {balance:,.2f} USDT | Pure reverse bot active")
 
-    heartbeat_counter = 0
+    loop_count = 0
     current_dd = 0.0
 
     while True:
         try:
-            heartbeat_counter += 1
-            if heartbeat_counter % 60 == 0:          # every 5 minutes (5s loop * 60 = 300s)
+            loop_count += 1
+
+            # Heartbeat every 5 min
+            if loop_count % 60 == 0:
                 current_balance = get_balance(exchange)
                 current_dd = (peak_balance - current_balance) / peak_balance
                 peak_balance = max(peak_balance, current_balance)
                 heartbeat(current_balance, current_dd)
 
-            # new candle?
+            # New 1h candle?
             new = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME,
                                       since=int(last_ts.timestamp()*1000)+1, limit=2)
             if new:
@@ -119,85 +112,57 @@ if __name__ == '__main__':
                 if not ndf.empty and ndf.index[-1] > last_ts:
                     df = pd.concat([df, ndf]).tail(LOOKBACK)
                     last_ts = df.index[-1]
-                    print(f"NEW CANDLE | {last_ts}")
+                    print(f"NEW 1H CANDLE | {last_ts}")
 
             df = calculate_ema_super_signal(df)
-            cur  = df.iloc[-1]
             prev = df.iloc[-2]
-            price = cur['close']
 
             long_signal = prev['plFound']
             short_signal = prev['phFound']
 
-            # REVERSE LOGIC
-            if position == 'long' and short_signal:
-                close_position(exchange, 'long', trade_count * QUANTITY)
-                place_order(exchange, 'sell', QUANTITY)   # open short
-                position = 'short'
-                trade_count = 1
-                avg_price = price
-                print("REVERSE LONG → SHORT")
+            # === 10-MIN CONFIRMATION FOR REVERSE ONLY ===
+            if pending_signal is None:
+                if position == 'long' and short_signal:
+                    pending_signal = 'short'
+                    signal_time = time.time()
+                    print("SHORT SIGNAL vs LONG position → waiting 10 min to reverse...")
+                elif position == 'short' and long_signal:
+                    pending_signal = 'long'
+                    signal_time = time.time()
+                    print("LONG SIGNAL vs SHORT position → waiting 10 min to reverse...")
+                elif position is None and long_signal:
+                    pending_signal = 'long'
+                    signal_time = time.time()
+                    print("LONG SIGNAL (flat) → waiting 10 min confirmation...")
+                elif position is None and short_signal:
+                    pending_signal = 'short'
+                    signal_time = time.time()
+                    print("SHORT SIGNAL (flat) → waiting 10 min confirmation...")
 
-            elif position == 'short' and long_signal:
-                close_position(exchange, 'short', trade_count * QUANTITY)
-                place_order(exchange, 'buy', QUANTITY)    # open long
-                position = 'long'
-                trade_count = 1
-                avg_price = price
-                print("REVERSE SHORT → LONG")
+            # Confirm after 10 min
+            if pending_signal and (time.time() - signal_time >= CONFIRM_SECONDS):
+                still_valid = (pending_signal == 'long' and prev['plFound']) or \
+                             (pending_signal == 'short' and prev['phFound'])
 
-            # NORMAL ENTRY (only when flat)
-            elif position is None:
-                if long_signal:
-                    place_order(exchange, 'buy', QUANTITY)
-                    position = 'long'
-                    trade_count = 1
-                    avg_price = price
-                    print("LONG ENTRY")
-                elif short_signal:
-                    place_order(exchange, 'sell', QUANTITY)
-                    position = 'short'
-                    trade_count = 1
-                    avg_price = price
-                    print("SHORT ENTRY")
+                if still_valid:
+                    new_side = 'buy' if pending_signal == 'long' else 'sell'
+                    print(f"CONFIRMED {pending_signal.upper()} → REVERSING NOW!")
+                    close_and_reverse(exchange, position, new_side)
+                    position = pending_signal
+                else:
+                    print("Signal disappeared in 10 min → ignored")
 
-            # PYRAMID (only same direction, on price pullback)
-            if position == 'long' and price <= avg_price * (1 - PERCENT_DROP) and trade_count < PYRAMID_MAX:
-                place_order(exchange, 'buy', QUANTITY)
-                trade_count += 1
-                avg_price = (avg_price * (trade_count-1) * QUANTITY + price * QUANTITY) / (trade_count * QUANTITY)
-                print(f"PYRAMID LONG #{trade_count}")
+                pending_signal = None
 
-            if position == 'short' and price >= avg_price * (1 + PERCENT_DROP) and trade_count < PYRAMID_MAX:
-                place_order(exchange, 'sell', QUANTITY)
-                trade_count += 1
-                avg_price = (avg_price * (trade_count-1) * QUANTITY + price * QUANTITY) / (trade_count * QUANTITY)
-                print(f"PYRAMID SHORT #{trade_count}")
-
-            # TAKE PROFIT EXIT
-            if position == 'long' and price >= avg_price * (1 + PERCENT_EXIT):
-                close_position(exchange, 'long', trade_count * QUANTITY)
-                pnl = (price - avg_price) * trade_count * QUANTITY * LEVERAGE
-                print(f"LONG TP HIT | PnL ~{pnl:+.1f} USDT")
-                position = None
-                trade_count = 0
-
-            if position == 'short' and price <= avg_price * (1 - PERCENT_EXIT):
-                close_position(exchange, 'short', trade_count * QUANTITY)
-                pnl = (avg_price - price) * trade_count * QUANTITY * LEVERAGE
-                print(f"SHORT TP HIT | PnL ~{pnl:+.1f} USDT")
-                position = None
-                trade_count = 0
-
-            # Global DD check
+            # DD check
             current_balance = get_balance(exchange)
             current_dd = (peak_balance - current_balance) / peak_balance
             peak_balance = max(peak_balance, current_balance)
             if current_dd > MAX_DD_STOP:
-                print("MAX DRAWDOWN 90% REACHED - BOT STOPPED")
+                print("MAX DD 90% HIT - STOPPING BOT")
                 break
 
-            time.sleep(5)
+            time.sleep(10)
 
         except KeyboardInterrupt:
             print("\nBot stopped by user")
