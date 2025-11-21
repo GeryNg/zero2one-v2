@@ -4,8 +4,10 @@ import pandas as pd
 import json
 import time
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from strategy2 import calculate_ema_super_signal
+
+MYT = timezone(timedelta(hours=8))
 
 # ================== CONFIG ==================
 SYMBOL          = 'BTCUSDT'
@@ -62,8 +64,8 @@ def close_and_reverse(ex, current_side, new_side):
         print(f"OPEN FAILED: {e}")
 
 def heartbeat(balance, dd):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"HEARTBEAT | {now} | Balance {balance:,.2f} USDT | DD {dd*100:5.2f}%")
+    now_myt = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"HEARTBEAT | {now_myt} MYT | Balance {balance:,.2f} USDT | DD {dd*100:5.2f}%")
 
 # ================== MAIN ==================
 if __name__ == '__main__':
