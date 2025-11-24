@@ -1,4 +1,4 @@
-# live_bot.py  <-- PURE REVERSE BOT (No TP, 10-min confirm, reverse only)
+# live_bot.py  <-- PURE REVERSE BOT (No TP, immediate entry on 1h signal, UTC+8 MYT)
 import ccxt
 import pandas as pd
 import json
@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone, timedelta
 from strategy2 import calculate_ema_super_signal
 
+# Malaysia timezone (UTC+8 Kuala Lumpur)
 MYT = timezone(timedelta(hours=8))
 
 # ================== CONFIG ==================
@@ -16,7 +17,6 @@ QUANTITY        = 0.007
 LEVERAGE        = 10
 LOOKBACK        = 200
 MAX_DD_STOP     = 0.90
-CONFIRM_SECONDS = 600   # 10 minutes
 # ===========================================
 
 def load_config(mode='demo'):
@@ -82,8 +82,6 @@ if __name__ == '__main__':
     df.set_index('ts', inplace=True)
 
     position = None                    # 'long', 'short', or None
-    pending_signal = None              # 'long' or 'short'
-    signal_time = 0
     last_ts = df.index[-1]
 
     balance = get_balance(exchange)
@@ -116,45 +114,21 @@ if __name__ == '__main__':
                     last_ts = df.index[-1]
                     print(f"NEW 1H CANDLE | {last_ts}")
 
-            df = calculate_ema_super_signal(df)
-            prev = df.iloc[-2]
+                    # Compute signals on the new closed candle
+                    df = calculate_ema_super_signal(df)
+                    prev = df.iloc[-2]  # signal on previous closed candle
 
-            long_signal = prev['plFound']
-            short_signal = prev['phFound']
+                    long_signal = prev['plFound']
+                    short_signal = prev['phFound']
 
-            # === 10-MIN CONFIRMATION FOR REVERSE ONLY ===
-            if pending_signal is None:
-                if position == 'long' and short_signal:
-                    pending_signal = 'short'
-                    signal_time = time.time()
-                    print("SHORT SIGNAL vs LONG position → waiting 10 min to reverse...")
-                elif position == 'short' and long_signal:
-                    pending_signal = 'long'
-                    signal_time = time.time()
-                    print("LONG SIGNAL vs SHORT position → waiting 10 min to reverse...")
-                elif position is None and long_signal:
-                    pending_signal = 'long'
-                    signal_time = time.time()
-                    print("LONG SIGNAL (flat) → waiting 10 min confirmation...")
-                elif position is None and short_signal:
-                    pending_signal = 'short'
-                    signal_time = time.time()
-                    print("SHORT SIGNAL (flat) → waiting 10 min confirmation...")
-
-            # Confirm after 10 min
-            if pending_signal and (time.time() - signal_time >= CONFIRM_SECONDS):
-                still_valid = (pending_signal == 'long' and prev['plFound']) or \
-                             (pending_signal == 'short' and prev['phFound'])
-
-                if still_valid:
-                    new_side = 'buy' if pending_signal == 'long' else 'sell'
-                    print(f"CONFIRMED {pending_signal.upper()} → REVERSING NOW!")
-                    close_and_reverse(exchange, position, new_side)
-                    position = pending_signal
-                else:
-                    print("Signal disappeared in 10 min → ignored")
-
-                pending_signal = None
+                    if long_signal or short_signal:
+                        new_position = 'long' if long_signal else 'short'
+                        new_side = 'buy' if long_signal else 'sell'
+                        
+                        if position != new_position:
+                            print(f"{new_position.upper()} SIGNAL DETECTED → REVERSING NOW!")
+                            close_and_reverse(exchange, position, new_side)
+                            position = new_position
 
             # DD check
             current_balance = get_balance(exchange)
