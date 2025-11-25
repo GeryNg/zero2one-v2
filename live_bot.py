@@ -1,4 +1,4 @@
-# live_bot.py  <-- PURE REVERSE BOT (No TP, immediate entry on 1h signal, UTC+8 MYT)
+# live_bot.py  <-- FIXED IMMEDIATE LIVE SIGNAL (Mid-hour entry + MYT time + sync position)
 import ccxt
 import pandas as pd
 import json
@@ -47,6 +47,15 @@ def get_balance(ex):
     except:
         return 50000.0
 
+def get_current_position(ex):
+    try:
+        pos = ex.fetch_positions([SYMBOL])[0]
+        if pos['contracts'] > 0:
+            return pos['side']
+    except:
+        pass
+    return None
+
 def close_and_reverse(ex, current_side, new_side):
     if current_side:
         close_side = 'sell' if current_side == 'long' else 'buy'
@@ -81,15 +90,16 @@ if __name__ == '__main__':
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('ts', inplace=True)
 
-    position = None                    # 'long', 'short', or None
+    position = get_current_position(exchange)  # sync existing position at start
     last_ts = df.index[-1]
 
     balance = get_balance(exchange)
     peak_balance = balance
-    print(f"Starting balance: {balance:,.2f} USDT | Pure reverse bot active")
+    print(f"Starting balance: {balance:,.2f} USDT | Pure reverse bot active | Initial position: {position if position else 'NONE'}")
 
     loop_count = 0
     current_dd = 0.0
+    acted_on_bar = False  # to act only once per bar
 
     while True:
         try:
@@ -102,33 +112,50 @@ if __name__ == '__main__':
                 peak_balance = max(peak_balance, current_balance)
                 heartbeat(current_balance, current_dd)
 
-            # New 1h candle?
-            new = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME,
-                                      since=int(last_ts.timestamp()*1000)+1, limit=2)
-            if new:
-                ndf = pd.DataFrame(new, columns=['ts','open','high','low','close','volume'])
-                ndf['ts'] = pd.to_datetime(ndf['ts'], unit='ms')
-                ndf.set_index('ts', inplace=True)
-                if not ndf.empty and ndf.index[-1] > last_ts:
-                    df = pd.concat([df, ndf]).tail(LOOKBACK)
-                    last_ts = df.index[-1]
-                    print(f"NEW 1H CANDLE | {last_ts}")
+            # Fetch latest ongoing candle (live data)
+            live = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1)[0]
+            live_ts = pd.to_datetime(live[0], unit='ms')
 
-                    # Compute signals on the new closed candle
-                    df = calculate_ema_super_signal(df)
-                    prev = df.iloc[-2]  # signal on previous closed candle
+            if live_ts > last_ts:
+                # New bar started, reset acted flag
+                acted_on_bar = False
+                last_ts = live_ts
+                print(f"NEW 1H CANDLE | {live_ts}")
 
-                    long_signal = prev['plFound']
-                    short_signal = prev['phFound']
+            # Update or append the live candle
+            if live_ts == df.index[-1]:
+                # Update ongoing bar
+                df.at[df.index[-1], 'high'] = max(df.at[df.index[-1], 'high'], live[2])
+                df.at[df.index[-1], 'low'] = min(df.at[df.index[-1], 'low'], live[3])
+                df.at[df.index[-1], 'close'] = live[4]
+                df.at[df.index[-1], 'volume'] = live[5]
+            else:
+                # Append new bar
+                new_row = pd.Series({
+                    'open': live[1],
+                    'high': live[2],
+                    'low': live[3],
+                    'close': live[4],
+                    'volume': live[5]
+                }, name=live_ts)
+                df = pd.concat([df, new_row.to_frame().T]).tail(LOOKBACK)
 
-                    if long_signal or short_signal:
-                        new_position = 'long' if long_signal else 'short'
-                        new_side = 'buy' if long_signal else 'sell'
-                        
-                        if position != new_position:
-                            print(f"{new_position.upper()} SIGNAL DETECTED → REVERSING NOW!")
-                            close_and_reverse(exchange, position, new_side)
-                            position = new_position
+            # Compute live signal on updated df
+            df = calculate_ema_super_signal(df)
+            cur = df.iloc[-1]  # live signal on ongoing bar
+
+            long_signal = cur['plFound']
+            short_signal = cur['phFound']
+
+            if long_signal or short_signal:
+                new_position = 'long' if long_signal else 'short'
+                new_side = 'buy' if long_signal else 'sell'
+                
+                if position != new_position and not acted_on_bar:
+                    print(f"{new_position.upper()} SIGNAL DETECTED → REVERSING NOW!")
+                    close_and_reverse(exchange, position, new_side)
+                    position = new_position
+                    acted_on_bar = True  # act only once per bar
 
             # DD check
             current_balance = get_balance(exchange)
