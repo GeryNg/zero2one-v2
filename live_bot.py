@@ -1,4 +1,4 @@
-# live_bot.py  <-- FIXED IMMEDIATE LIVE SIGNAL (Mid-hour entry + MYT time + sync position)
+# live_bot.py  <-- FINAL MALAYSIA REVERSE BOT (Instant signal + No DD limit + MYT time)
 import ccxt
 import pandas as pd
 import json
@@ -16,7 +16,6 @@ TIMEFRAME       = '1h'
 QUANTITY        = 0.007
 LEVERAGE        = 10
 LOOKBACK        = 200
-MAX_DD_STOP     = 0.90
 # ===========================================
 
 def load_config(mode='demo'):
@@ -38,7 +37,7 @@ def setup_exchange(config, mode):
         ex.set_leverage(LEVERAGE, SYMBOL)
     except:
         pass
-    print(f"Connected to Bybit {'DEMO' if mode=='demo' else 'LIVE'} | {SYMBOL} PERPETUAL | 10x | REVERSE ONLY")
+    print(f"Connected to Bybit {'DEMO' if mode=='demo' else 'LIVE'} | {SYMBOL} PERPETUAL | 10x | INSTANT REVERSE")
     return ex
 
 def get_balance(ex):
@@ -72,9 +71,9 @@ def close_and_reverse(ex, current_side, new_side):
     except Exception as e:
         print(f"OPEN FAILED: {e}")
 
-def heartbeat(balance, dd):
+def heartbeat(balance):
     now_myt = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"HEARTBEAT | {now_myt} MYT | Balance {balance:,.2f} USDT | DD {dd*100:5.2f}%")
+    print(f"HEARTBEAT | {now_myt} MYT | Balance {balance:,.2f} USDT")
 
 # ================== MAIN ==================
 if __name__ == '__main__':
@@ -84,86 +83,68 @@ if __name__ == '__main__':
 
     exchange = setup_exchange(load_config(args.mode), args.mode)
 
-    # Load 200 candles
+    # Initial 200 candles
     ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LOOKBACK)
     df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('ts', inplace=True)
 
-    position = get_current_position(exchange)  # sync existing position at start
+    position = get_current_position(exchange)
     last_ts = df.index[-1]
 
     balance = get_balance(exchange)
-    peak_balance = balance
-    print(f"Starting balance: {balance:,.2f} USDT | Pure reverse bot active | Initial position: {position if position else 'NONE'}")
+    print(f"Starting balance: {balance:,.2f} USDT | Position: {position or 'FLAT'}")
 
     loop_count = 0
-    current_dd = 0.0
-    acted_on_bar = False  # to act only once per bar
+    acted_this_bar = False
 
     while True:
         try:
             loop_count += 1
 
-            # Heartbeat every 5 min
+            # Heartbeat every 5 minutes
             if loop_count % 60 == 0:
-                current_balance = get_balance(exchange)
-                current_dd = (peak_balance - current_balance) / peak_balance
-                peak_balance = max(peak_balance, current_balance)
-                heartbeat(current_balance, current_dd)
+                balance = get_balance(exchange)
+                heartbeat(balance)
 
-            # Fetch latest ongoing candle (live data)
+            # Get the latest (ongoing) 1h candle
             live = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1)[0]
             live_ts = pd.to_datetime(live[0], unit='ms')
 
+            # New candle started?
             if live_ts > last_ts:
-                # New bar started, reset acted flag
-                acted_on_bar = False
+                acted_this_bar = False
                 last_ts = live_ts
-                print(f"NEW 1H CANDLE | {live_ts}")
+                myt_time = datetime.fromtimestamp(live_ts.timestamp(), MYT).strftime("%Y-%m-%d %H:%M")
+                print(f"NEW 1H CANDLE STARTED | {myt_time} MYT")
 
-            # Update or append the live candle
+            # Update the current bar in df
             if live_ts == df.index[-1]:
-                # Update ongoing bar
-                df.at[df.index[-1], 'high'] = max(df.at[df.index[-1], 'high'], live[2])
-                df.at[df.index[-1], 'low'] = min(df.at[df.index[-1], 'low'], live[3])
-                df.at[df.index[-1], 'close'] = live[4]
-                df.at[df.index[-1], 'volume'] = live[5]
+                df.loc[df.index[-1], ['high','low','close','volume']] = [live[2], live[3], live[4], live[5]]
             else:
-                # Append new bar
-                new_row = pd.Series({
-                    'open': live[1],
-                    'high': live[2],
-                    'low': live[3],
-                    'close': live[4],
-                    'volume': live[5]
-                }, name=live_ts)
-                df = pd.concat([df, new_row.to_frame().T]).tail(LOOKBACK)
+                new_row = pd.DataFrame([{
+                    'open': live[1], 'high': live[2], 'low': live[3],
+                    'close': live[4], 'volume': live[5]
+                }], index=[live_ts])
+                df = pd.concat([df, new_row]).tail(LOOKBACK)
 
-            # Compute live signal on updated df
+            # Recalculate indicators on live data
             df = calculate_ema_super_signal(df)
-            cur = df.iloc[-1]  # live signal on ongoing bar
+            cur = df.iloc[-1]
 
-            long_signal = cur['plFound']
+            long_signal  = cur['plFound']
             short_signal = cur['phFound']
 
-            if long_signal or short_signal:
+            # Instant signal detection
+            if (long_signal or short_signal) and not acted_this_bar:
                 new_position = 'long' if long_signal else 'short'
                 new_side = 'buy' if long_signal else 'sell'
-                
-                if position != new_position and not acted_on_bar:
-                    print(f"{new_position.upper()} SIGNAL DETECTED → REVERSING NOW!")
+
+                if position != new_position:
+                    print(f"{new_position.upper()} SIGNAL → INSTANT REVERSE!")
                     close_and_reverse(exchange, position, new_side)
                     position = new_position
-                    acted_on_bar = True  # act only once per bar
-
-            # DD check
-            current_balance = get_balance(exchange)
-            current_dd = (peak_balance - current_balance) / peak_balance
-            peak_balance = max(peak_balance, current_balance)
-            if current_dd > MAX_DD_STOP:
-                print("MAX DD 90% HIT - STOPPING BOT")
-                break
+                    acted_this_bar = True
 
             time.sleep(10)
 
