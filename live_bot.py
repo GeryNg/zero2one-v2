@@ -1,11 +1,10 @@
-# live_bot.py  <-- FINAL MALAYSIA REVERSE BOT (Instant signal + No DD limit + MYT time)
 import ccxt
 import pandas as pd
 import json
 import time
 import argparse
 from datetime import datetime, timezone, timedelta
-from strategy2 import calculate_ema_super_signal
+from strategy3 import calculate_trend_forecast_signal
 
 # Malaysia timezone (UTC+8 Kuala Lumpur)
 MYT = timezone(timedelta(hours=8))
@@ -129,7 +128,7 @@ if __name__ == '__main__':
                 df = pd.concat([df, new_row]).tail(LOOKBACK)
 
             # Recalculate indicators on live data
-            df = calculate_ema_super_signal(df)
+            df = calculate_trend_forecast_signal(df)
             cur = df.iloc[-1]
 
             long_signal  = cur['plFound']
